@@ -12,25 +12,21 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Mqtt
 
     public abstract class MessageAsyncProcessorBase<T>
     {
+        readonly string scope;
         readonly Queue<T> backlogQueue;
         State state;
         readonly TaskCompletionSource completionSource;
 
-        protected MessageAsyncProcessorBase()
+        protected MessageAsyncProcessorBase(string scope)
         {
+            this.scope = scope;
             this.backlogQueue = new Queue<T>();
             this.completionSource = new TaskCompletionSource();
         }
 
-        public Task Completion
-        {
-            get { return this.completionSource.Task; }
-        }
+        public Task Completion => this.completionSource.Task;
 
-        public int BacklogSize
-        {
-            get { return this.backlogQueue.Count; }
-        }
+        public int BacklogSize => this.backlogQueue.Count;
 
         public void Post(IChannelHandlerContext context, T packet)
         {
@@ -84,7 +80,7 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Mqtt
                     while (queue.Count > 0)
                     {
                         T packet = queue.Dequeue();
-                        ReferenceCountUtil.Release(packet);
+                        ReferenceCountUtil.SafeRelease(packet);
                     }
                     break;
                 case State.Aborted:
@@ -102,7 +98,18 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Mqtt
                 while (queue.Count > 0 && this.state != State.Aborted)
                 {
                     T message = queue.Dequeue();
-                    await this.ProcessAsync(context, message);
+                    try
+                    {
+                        await this.ProcessAsync(context, message, this.scope);
+                        message = default(T); // dismissing packet reference as it has been successfully handed off in a form of message
+                    }
+                    finally
+                    {
+                        if (message != null)
+                        {
+                            ReferenceCountUtil.SafeRelease(message);
+                        }
+                    }
                 }
 
                 switch (this.state)
@@ -125,7 +132,7 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Mqtt
             }
         }
 
-        protected abstract Task ProcessAsync(IChannelHandlerContext context, T packet);
+        protected abstract Task ProcessAsync(IChannelHandlerContext context, T packet, string scope);
 
         enum State
         {

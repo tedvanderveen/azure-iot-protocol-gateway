@@ -8,12 +8,14 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
     using System.Diagnostics.Contracts;
     using System.Linq;
     using System.Net;
+    using System.Net.Security;
     using System.Threading;
     using System.Threading.Tasks;
     using DotNetty.Buffers;
     using DotNetty.Codecs.Mqtt;
     using DotNetty.Codecs.Mqtt.Packets;
     using DotNetty.Common.Concurrency;
+    using DotNetty.Common.Utilities;
     using DotNetty.Handlers.Tls;
     using DotNetty.Transport.Bootstrapping;
     using DotNetty.Transport.Channels;
@@ -58,23 +60,22 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
 
             var taskCompletionSource = new TaskCompletionSource();
             Bootstrap b = this.bootstrap.Clone();
+            var readHandler = new ReadListeningHandler(CommunicationTimeout);
             b.Handler(new ActionChannelInitializer<ISocketChannel>(
                 ch =>
                 {
                     ch.Pipeline.AddLast(
-                        TlsHandler.Client(this.tlsHostName, null, (sender, certificate, chain, errors) => true),
+                        new TlsHandler(stream => new SslStream(stream, true, (sender, certificate, chain, errors) => true), new ClientTlsSettings(this.tlsHostName)),
                         MqttEncoder.Instance,
                         new MqttDecoder(false, 256 * 1024),
-                        new TestScenarioRunner(
-                            cmf => this.GetCompleteScenario(cmf, deviceId, deviceSas, cancellationToken),
-                            taskCompletionSource,
-                            CommunicationTimeout,
-                            CommunicationTimeout),
+                        readHandler,
                         ConsoleLoggingHandler.Instance);
                 }));
 
-            await b.ConnectAsync(this.endpoint);
+            var channel = await b.ConnectAsync(this.endpoint);
 
+            await this.GetCompleteScenarioAsync(channel, readHandler, deviceId, deviceSas, cancellationToken);
+            
             return taskCompletionSource.Task;
         }
 
@@ -85,9 +86,9 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
             return true;
         }
 
-        IEnumerable<TestScenarioStep> GetCompleteScenario(Func<object> currentMessageFunc, string clientId, string password, CancellationToken cancellationToken)
+        async Task GetCompleteScenarioAsync(IChannel channel, ReadListeningHandler readHandler, string clientId, string password, CancellationToken cancellationToken)
         {
-            yield return TestScenarioStep.Write(new ConnectPacket
+            await channel.WriteAndFlushAsync(new ConnectPacket
             {
                 ClientId = clientId,
                 CleanSession = false,
@@ -98,7 +99,7 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
                 KeepAliveInSeconds = 120
             });
 
-            object message = currentMessageFunc();
+            object message = await readHandler.ReceiveAsync();
             var connackPacket = message as ConnAckPacket;
             if (connackPacket == null)
             {
@@ -109,21 +110,13 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
                 throw new InvalidOperationException(string.Format("{1}: Expected successful CONNACK, received CONNACK with return code of {0}", connackPacket.ReturnCode, clientId));
             }
 
-            foreach (TestScenarioStep step in this.GetScenario(currentMessageFunc, clientId, cancellationToken))
-            {
-                yield return step;
-            }
+            await this.GetScenario(channel, readHandler, clientId, cancellationToken);
         }
 
-        protected virtual IEnumerable<TestScenarioStep> GetScenario(Func<object> currentMessageFunc, string clientId,
+        protected virtual Task GetScenario(IChannel channel, ReadListeningHandler readHandler, string clientId,
             CancellationToken cancellationToken)
         {
-            return this.GetScenarioNested(currentMessageFunc, clientId, cancellationToken).SelectMany(_ => _);
-        }
-
-        protected virtual IEnumerable<IEnumerable<TestScenarioStep>> GetScenarioNested(Func<object> currentMessageFunc, string clientId, CancellationToken cancellationToken)
-        {
-            yield break;
+            return TaskEx.Completed;
         }
 
         protected abstract string Name { get; }
@@ -159,19 +152,19 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
             return Unpooled.WrappedBuffer(Payloads[size]);
         }
 
-        protected static IEnumerable<TestScenarioStep> GetSubscribeSteps(Func<object> currentMessageFunc, string clientId)
+        protected static Task GetSubscribeSteps(IChannel channel, ReadListeningHandler readHandler, string clientId)
         {
-            return GetSubscribeSteps(currentMessageFunc, clientId, "devices/{0}/messages/devicebound");
+            return GetSubscribeSteps(channel, readHandler, clientId, "devices/{0}/messages/devicebound");
         }
 
-        protected static IEnumerable<TestScenarioStep> GetSubscribeSteps(Func<object> currentMessageFunc, string clientId, string topicNamePattern)
+        protected static async Task GetSubscribeSteps(IChannel channel, ReadListeningHandler readHandler, string clientId, string topicNamePattern)
         {
             int subscribePacketId = Random.Next(1, ushort.MaxValue);
-            yield return TestScenarioStep.Write(
+            await channel.WriteAndFlushAsync(
                 new SubscribePacket(
                     subscribePacketId,
                     new SubscriptionRequest(string.Format(topicNamePattern, clientId), QualityOfService.ExactlyOnce)));
-            object message = currentMessageFunc();
+            object message = await readHandler.ReceiveAsync();
             var subackPacket = message as SubAckPacket;
             if (subackPacket == null)
             {
@@ -183,7 +176,7 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
             }
         }
 
-        protected static IEnumerable<TestScenarioStep> GetPublishSteps(Func<object> currentMessageFunc, string clientId, QualityOfService qos,
+        protected static async Task GetPublishSteps(IChannel channel, ReadListeningHandler readHandler, string clientId, QualityOfService qos,
             string topicNamePattern, int count, int minPayloadSize, int maxPayloadSize)
         {
             Contract.Requires(count > 0);
@@ -197,26 +190,21 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Tests.Load
                     Payload = GetPayloadBuffer(Random.Next(minPayloadSize, maxPayloadSize))
                 })
                 .ToArray();
-            yield return TestScenarioStep.Write(qos > QualityOfService.AtMostOnce, publishPackets);
+            await channel.WriteAndFlushManyAsync(publishPackets);
 
             if (qos == QualityOfService.AtMostOnce)
             {
-                yield break;
+                return;
             }
 
             int acked = 0;
             do
             {
-                object receivedMessage = currentMessageFunc();
+                object receivedMessage = await readHandler.ReceiveAsync();
                 var pubackPacket = receivedMessage as PubAckPacket;
                 if (pubackPacket == null || pubackPacket.PacketId != publishPackets[acked].PacketId)
                 {
                     throw new InvalidOperationException($"{clientId}: Expected PUBACK({publishPackets[acked].PacketId.ToString()}), received {receivedMessage}");
-                }
-
-                if (acked < count - 1)
-                {
-                    yield return TestScenarioStep.ReadMore();
                 }
 
                 acked++;

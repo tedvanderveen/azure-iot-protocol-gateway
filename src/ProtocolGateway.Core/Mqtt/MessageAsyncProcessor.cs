@@ -11,14 +11,12 @@ namespace Microsoft.Azure.Devices.ProtocolGateway.Mqtt
     {
         readonly Func<IChannelHandlerContext, T, Task> processFunc;
 
-        public MessageAsyncProcessor(Func<IChannelHandlerContext, T, Task> processFunc)
+        public MessageAsyncProcessor(Func<IChannelHandlerContext, T, Task> processFunc, string scope)
+            : base(scope)
         {
             this.processFunc = processFunc;
         }
 
-        protected override Task ProcessAsync(IChannelHandlerContext context, T packet)
-        {
-            return this.processFunc(context, packet);
-        }
+        protected override Task ProcessAsync(IChannelHandlerContext context, T packet, string scope) => this.processFunc(context, packet);
     }
 }

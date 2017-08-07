@@ -7,6 +7,7 @@ namespace Microsoft.Azure.Devices.ProtocolGateway
     using System.Collections.Generic;
     using System.Diagnostics.Contracts;
     using System.Text;
+    using System.Text.RegularExpressions;
 
     public class UriPathTemplate
     {
@@ -15,12 +16,15 @@ namespace Microsoft.Azure.Devices.ProtocolGateway
         const char WildcardCharacter = '*';
         const char VariablePlaceholderStartCharacter = '{';
         const char VariablePlaceholderEndCharacter = '}';
+        const char PeriodCharacter = '.';
         const int EstimatedVariableValueLength = 20;
 
         public static readonly char[] PathSegmentTerminationCharacters = { PathSeparator };
 
         TemplatePart[] parts;
         int projectedLength;
+        Regex pattern;
+        IList<string> variablesName;
 
         public UriPathTemplate(string template)
         {
@@ -55,9 +59,30 @@ namespace Microsoft.Azure.Devices.ProtocolGateway
             return result.ToString();
         }
 
+        public IList<KeyValuePair<string, string>> Match(Uri uri)
+        {
+            IList<KeyValuePair<string, string>> result = new List<KeyValuePair<string, string>>();
+            Match match = this.pattern.Match(uri.ToString());
+            while (match.Success)
+            {
+                for(int i = 1; i < match.Groups.Count; i++)
+                {
+                    string value = match.Groups[i].Value;
+                    result.Add(new KeyValuePair<string, string>(this.variablesName[i-1], value));
+                }
+
+                match = match.NextMatch();
+            }
+
+            return result;
+        }
+
         void Compile(string template)
         {
             var templateParts = new List<TemplatePart>();
+            StringBuilder pattern = new StringBuilder();
+            this.variablesName = new List<string>();
+
             int initialCapacity = 0;
 
             int length = template.Length;
@@ -110,16 +135,31 @@ namespace Microsoft.Azure.Devices.ProtocolGateway
                     {
                         int partLength = varStartIndex - index;
                         templateParts.Add(new TemplatePart(template.Substring(index, partLength)));
+                        pattern.Append(Regex.Escape(template.Substring(index, partLength)));
                         initialCapacity += partLength;
                     }
                     templateParts.Add(new TemplatePart(varName, varDefaultValue));
+                    this.variablesName.Add(varName);
+                    pattern.Append("([^/]*)");
                     initialCapacity += EstimatedVariableValueLength;
                     index = varEndIndex + 1;
                 }
                 else
                 {
                     int partLength = length - index;
-                    templateParts.Add(new TemplatePart(template.Substring(index, partLength)));
+                    string part = template.Substring(index, partLength);
+                    templateParts.Add(new TemplatePart(part));
+                    // don't escape wildcard if it is at the end of the template
+                    if (part.EndsWith(WildcardCharacter.ToString()) && index + partLength == length)
+                    {
+                        pattern.Append(Regex.Escape(part.Substring(0, partLength -1)));
+                        pattern.Append(PeriodCharacter.ToString() + WildcardCharacter.ToString());
+                    }
+                    else
+                    {
+                        pattern.Append(Regex.Escape(part));
+                    }
+                    
                     initialCapacity += partLength;
                     index = length;
                 }
@@ -127,12 +167,30 @@ namespace Microsoft.Azure.Devices.ProtocolGateway
 
             this.parts = templateParts.ToArray();
             this.projectedLength = initialCapacity;
+            pattern.Append("$");
+            this.pattern = new Regex(pattern.ToString(), RegexOptions.Compiled);
         }
 
         struct TemplatePart
         {
             readonly string variableName;
             readonly string value;
+
+            public string VariableName
+            {
+                get
+                {
+                    return this.variableName;
+                }
+            }
+
+            public string Value
+            {
+                get
+                {
+                    return this.value;
+                }
+            }
 
             public TemplatePart(string value)
             {

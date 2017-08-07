@@ -3,6 +3,7 @@
 TestResults/
 .nuget/
 _ReSharper.*/
+*.exe
 packages/
 artifacts/
 PublishProfiles/
@@ -18,6 +19,7 @@ nuget.exe
 *k10.csproj
 *.psess
 *.vsp
+.vs/
 *.pidb
 *.userprefs
 *DS_Store
